@@ -4,11 +4,6 @@ using UnityEngine;
 
 public static class MeshGenLookup
 {
-    public static void GetTriTable()
-    {
-
-    }
-
     public static int[] GetOffsets(int vCountZ, int vCountYZ)
     {
         return new int[8]

@@ -1,19 +1,29 @@
 using System;
 using System.Collections;
 using System.Collections.Generic;
+using System.Linq;
 using System.Threading.Tasks;
 using Unity.Collections;
+using Unity.Collections.LowLevel.Unsafe;
 using UnityEngine;
+using UnityEngine.Rendering;
 
 namespace zombGen
 {
-    public readonly struct VoxObject
+    public readonly unsafe struct VoxObject
     {
-        public readonly byte[] voxs;
+        public readonly float* voxs;
         public readonly Vector3 start;
         public readonly Vector3 voxSize;
         public readonly float surface;
 
+        public readonly NativeList<uint> tris;
+        public readonly NativeList<Vector3> vers;
+        public readonly NativeList<Vector3> nors;
+
+        /// <summary>
+        /// Lenght of voxs, -1 if invalid
+        /// </summary>
         public readonly int vCountXYZ;
         public readonly int vCountYZ;
         public readonly int vCountZ;
@@ -23,7 +33,40 @@ namespace zombGen
         #region Voxelization
 
         /// <summary>
-        /// Voxelizes the given collider. The voxels has the size defined in voxGlobalSettings.cs
+        /// DO NOT ACCESS this after disposing (Returns new cleared VoxObject)
+        /// </summary>
+        public VoxObject Dispose()
+        {
+            if (vCountXYZ < 0) return this;
+
+            UnsafeUtility.Free(voxs, Allocator.Persistent);
+            tris.Dispose();
+            vers.Dispose();
+            nors.Dispose();
+            return new(true);
+        }
+
+        private VoxObject(bool unused)
+        {
+            voxs = null;
+            start = Vector3.zero;
+            voxSize = Vector3.zero;
+            surface = 0.0f;
+
+            tris = new();
+            vers = new();
+            nors = new();
+
+            vCountXYZ = -1;
+            vCountYZ = -1;
+            vCountZ = -1;
+            vCountY = -1;
+            vCountX = -1;
+        }
+
+        /// <summary>
+        /// Voxelizes the given collider. (Mainthread only)
+        /// DONT FORGET TO CALL this.Dispose() in OnDestroy or similar
         /// </summary>
         public VoxObject(Collider col, bool tryFillConvaveInteriors = true)
         {
@@ -56,9 +99,12 @@ namespace zombGen
             Vector3 voxelSizeHalf = voxelSize * 0.501f;
             Vector3 voxelSizeHalfReal = voxelSize * 0.5f;
             int vCountXYZ = vCountX * vCountY * vCountZ;
-            byte[] voxs = new byte[vCountXYZ];
+            float* voxs = null;
+            int overlappingVoxCount = 0;
+
             if (vCountXYZ <= 0)
             {
+                vCountXYZ = -1;
                 Debug.LogWarning(col.transform.name + " wont contain any voxels! Is the object too small?");
                 goto SkipCreation;
             }
@@ -67,6 +113,7 @@ namespace zombGen
                 * MeshGenGlobals.maxVoxelsInExtent
                 * MeshGenGlobals.maxVoxelsInExtent)
             {
+                vCountXYZ = -1;
                 Debug.Log(col.transform.name + " cant be voxelized because its bounds are too large, bounds volume: " + vCountXYZ);
                 goto SkipCreation;
             }
@@ -96,19 +143,29 @@ namespace zombGen
             //Check result
             int colId = col.GetInstanceID();
 
+            voxs = (float*)UnsafeUtility.Malloc(vCountXYZ * sizeof(float),
+                UnsafeUtility.AlignOf<float>(), Allocator.Persistent);
+            UnsafeUtility.MemClear(voxs, vCountXYZ * sizeof(float));
+
             Parallel.For(0, vCountXYZ, vI =>
             {
                 int maxRI = (vI * MeshGenGlobals.voxelizeMaxHits) + MeshGenGlobals.voxelizeMaxHits;
                 for (int rI = vI * MeshGenGlobals.voxelizeMaxHits; rI < maxRI; rI++)
                 {
                     if (results[rI].instanceID != colId) continue;
-                    voxs[vI] = 1;
-                    return;
+                    if (vI < 0 || vI >= vCountXYZ)
+                    {
+                        continue;
+                    }
+
+                    voxs[vI] = 1.0f;
+                    overlappingVoxCount++;
+                    break;
                 }
             });
 
             results.Dispose();
-            
+
             //Floodfill
             if (tryFillConvaveInteriors == true && col is MeshCollider mc && mc.convex == false && mc.sharedMesh != null)
             {
@@ -198,21 +255,28 @@ namespace zombGen
             this.vCountX = vCountX;
             surface = 0.0f;
 
+            int initialVerCount = overlappingVoxCount * 5 * 3;
+            tris = new NativeList<uint>(initialVerCount, Allocator.Persistent);
+            vers = new NativeList<Vector3>(initialVerCount, Allocator.Persistent);
+            nors = new NativeList<Vector3>(initialVerCount, Allocator.Persistent);
+
             col.gameObject.layer = ogLayer;
             col.transform.rotation = ogRot;
         }
         #endregion Voxelization
 
-        public void Meshify(Transform ttt)
+        public void Meshify(Mesh.MeshData md, out Bounds boundsLocal)
         {
-            Vector3 scale = ttt.lossyScale;
             Vector3 voxSize = new(this.voxSize.x, this.voxSize.y, this.voxSize.z);
-            List<Vector3> vers = new(64);
-            List<int> tris = new(64);
             float[] cubeValues = new float[8];
-
             var offsets = MeshGenLookup.GetOffsets(vCountZ, vCountYZ);
             var edgeVertex = new Vector3[12];
+            Vector3 minPos = Vector3.one * 69420.0f; ;
+            Vector3 maxPos = -minPos;
+
+            vers.Clear();
+            tris.Clear();
+            nors.Clear();
 
             for (int vI = 0; vI < vCountXYZ; vI++)
             {
@@ -268,26 +332,45 @@ namespace zombGen
                 for (int i = 0; i < 5; i++)
                 {
                     if (MeshGenLookup.TriangleConnectionTable[cubeIndex, 3 * i] < 0) break;
-                    int idx = vers.Count;
 
-                    for (int ii = 0; ii < 3; ii++)
-                    {
-                        int verI = MeshGenLookup.TriangleConnectionTable[cubeIndex, 3 * i + ii];
-                        tris.Add(idx + (2 - ii));//Invert ii order to flip faces
-                        vers.Add(edgeVertex[verI]);
-                    }
+                    Vector3 ev0 = edgeVertex[MeshGenLookup.TriangleConnectionTable[cubeIndex, 3 * i]];
+                    Vector3 ev1 = edgeVertex[MeshGenLookup.TriangleConnectionTable[cubeIndex, (3 * i) + 1]];
+                    Vector3 ev2 = edgeVertex[MeshGenLookup.TriangleConnectionTable[cubeIndex, (3 * i) + 2]];
+                    minPos = Vector3.Min(minPos, Vector3.Min(Vector3.Min(ev0, ev1), ev2));
+                    maxPos = Vector3.Max(maxPos, Vector3.Max(Vector3.Max(ev0, ev1), ev2));
+
+                    vers.Add(ev0);
+                    vers.Add(ev1);
+                    vers.Add(ev2);
+
+                    Vector3 nor = Vector3.Normalize(Vector3.Cross(ev1 - ev2, ev0 - ev2));
+                    nors.Add(nor);//Cross order is reversed as tri order
+                    nors.Add(nor);
+                    nors.Add(nor);
+
+                    uint idx = (uint)tris.Length;
+                    tris.Add(idx + 2);
+                    tris.Add(idx + 1);
+                    tris.Add(idx);
                 }
             }
 
-            Mesh m = new()
-            {
-                vertices = vers.ToArray(),
-                triangles = tris.ToArray(),
-            };
+            //Write result to mesh
+            boundsLocal = new((minPos + maxPos) / 2, maxPos - minPos);
 
-            m.RecalculateNormals();
-            m.RecalculateBounds();
-            Gizmos.DrawMesh(m, 0, ttt.position, ttt.rotation, ttt.lossyScale);
+            NativeArray<VertexAttributeDescriptor> layout = new(2, Allocator.Temp);
+            layout[0] = new VertexAttributeDescriptor(VertexAttribute.Position, VertexAttributeFormat.Float32, 3, 0);
+            layout[1] = new VertexAttributeDescriptor(VertexAttribute.Normal, VertexAttributeFormat.Float32, 3, 1);
+            //layout[2] = new VertexAttributeDescriptor(VertexAttribute.Tangent, VertexAttributeFormat.Float32, 4, 2);
+            //layout[3] = new VertexAttributeDescriptor(VertexAttribute.TexCoord0, VertexAttributeFormat.Float32, 2, 3);
+            md.SetVertexBufferParams(vers.Length, layout);
+            md.SetIndexBufferParams(tris.Length, IndexFormat.UInt32);
+            md.subMeshCount = 1;
+            vers.AsArray().CopyTo(md.GetVertexData<Vector3>(0));
+            nors.AsArray().CopyTo(md.GetVertexData<Vector3>(1));
+            tris.AsArray().CopyTo(md.GetIndexData<uint>());
+            md.SetSubMesh(0, new(0, tris.Length, MeshTopology.Triangles));
+            layout.Dispose();
         }
 
         public readonly Vector3 VoxIndexToPosL(int voxI)
@@ -323,7 +406,7 @@ namespace zombGen
 
         #endregion Generic
 
-       
+
     }
 }
 

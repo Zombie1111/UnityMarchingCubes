@@ -1,6 +1,7 @@
 using System.Collections;
 using System.Collections.Generic;
 using UnityEngine;
+using UnityEngine.Rendering;
 
 namespace zombGen
 {
@@ -32,22 +33,13 @@ namespace zombGen
 #endif
 
         private bool isInitilized = false;
-
-        private void OnDrawGizmosSelected()
-        {
-            if (voxO.vCountXYZ == 0)
-            {
-                if (startShape != null) Gizmos.DrawWireMesh(startShape, 0, transform.position, transform.rotation, transform.localScale);
-                return;
-            }
-
-            voxO.Meshify(transform);
-        }
-
         private VoxObject voxO;
         private int lastShapeID = 0;
         private int _currentShapeID => startShape != null ? startShape.GetInstanceID() : 0;
         private MeshCollider col = null;
+        private MeshFilter mf = null;
+        private MeshRenderer mr = null;
+        private Mesh mesh = null;
 
         private void Init()
         {
@@ -55,22 +47,42 @@ namespace zombGen
             isInitilized = true;
             lastShapeID = _currentShapeID;
             col = this.GetOrAddComponent<MeshCollider>(out _);
-
-            if (startShape != null)
-            {
-                col.sharedMesh = startShape;
-                voxO = new(col);
-            }
+            mf = this.GetOrAddComponent<MeshFilter>(out _);
+            mr = this.GetOrAddComponent<MeshRenderer>(out _);
+            col.sharedMesh = startShape;
+            
+            if (startShape != null) voxO = new(col);
             else if (TryGetComponent(out Collider othCol) == true && othCol.enabled == true)
             {
                 voxO = new(col);
             }
+            
+            mesh = new();
+            col.sharedMesh = mesh;
+            mf.sharedMesh = mesh;
         }
 
         private void Dispose()
         {
             if (isInitilized == false) return;
             isInitilized = false;
+
+            voxO = voxO.Dispose();
+            mesh.Clear();
+        }
+        
+        private const MeshUpdateFlags _defaultUpdateFlags =
+              MeshUpdateFlags.DontRecalculateBounds
+            | MeshUpdateFlags.DontValidateIndices
+            | MeshUpdateFlags.DontResetBoneBounds;
+
+        private void Update()
+        {
+            if (isInitilized == false) return;
+            Mesh.MeshDataArray mda = Mesh.AllocateWritableMeshData(1);
+            voxO.Meshify(mda[0], out Bounds boundsL);
+            Mesh.ApplyAndDisposeWritableMeshData(mda, mesh, _defaultUpdateFlags);
+            mesh.bounds = boundsL;
         }
     }
 }
