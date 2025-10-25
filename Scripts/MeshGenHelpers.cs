@@ -2,9 +2,11 @@ using System;
 using System.Collections;
 using System.Collections.Generic;
 using System.Linq;
+using System.Runtime.CompilerServices;
 using System.Threading.Tasks;
 using Unity.Collections;
 using Unity.Collections.LowLevel.Unsafe;
+using Unity.Mathematics;
 using UnityEngine;
 using UnityEngine.Rendering;
 
@@ -13,13 +15,13 @@ namespace zombGen
     public readonly unsafe struct VoxObject
     {
         public readonly float* voxs;
-        public readonly Vector3 start;
-        public readonly Vector3 voxSize;
+        public readonly float3 start;
+        public readonly float3 voxSize;
         public readonly float surface;
 
         public readonly NativeList<uint> tris;
-        public readonly NativeList<Vector3> vers;
-        public readonly NativeList<Vector3> nors;
+        public readonly NativeList<float3> vers;
+        public readonly NativeList<float3> nors;
 
         /// <summary>
         /// Lenght of voxs, -1 if invalid
@@ -257,8 +259,8 @@ namespace zombGen
 
             int initialVerCount = overlappingVoxCount * 5 * 3;
             tris = new NativeList<uint>(initialVerCount, Allocator.Persistent);
-            vers = new NativeList<Vector3>(initialVerCount, Allocator.Persistent);
-            nors = new NativeList<Vector3>(initialVerCount, Allocator.Persistent);
+            vers = new NativeList<float3>(initialVerCount, Allocator.Persistent);
+            nors = new NativeList<float3>(initialVerCount, Allocator.Persistent);
 
             col.gameObject.layer = ogLayer;
             col.transform.rotation = ogRot;
@@ -267,20 +269,30 @@ namespace zombGen
 
         public void Meshify(Mesh.MeshData md, out Bounds boundsLocal)
         {
-            Vector3 voxSize = new(this.voxSize.x, this.voxSize.y, this.voxSize.z);
-            float[] cubeValues = new float[8];
-            var offsets = MeshGenLookup.GetOffsets(vCountZ, vCountYZ);
-            var edgeVertex = new Vector3[12];
-            Vector3 minPos = Vector3.one * 69420.0f; ;
-            Vector3 maxPos = -minPos;
+            //Alloc
+            float* cubeValues = (float*)UnsafeUtility.Malloc(8 * sizeof(float),
+                UnsafeUtility.AlignOf<float>(), Allocator.Temp);
+            float3* edgeVertex = (float3*)UnsafeUtility.Malloc(12 * 3 * sizeof(float),
+                UnsafeUtility.AlignOf<float3>(), Allocator.Temp);
 
+            //We could persistent allocate these in a readonly struct and pass along that, worth it?
+            int* offsets = MeshGenLookup.GetOffsets(vCountZ, vCountYZ);
+            int* cubeEdgeFlags = MeshGenLookup.GetCubeEdgeFlags();
+            int2* edgeConnections = MeshGenLookup.GetEdgeConnections();
+            float3* edgeDirections = MeshGenLookup.GetEdgeDirections();
+            float3* vertexOffsets = MeshGenLookup.GetVertexOffsets();
+            int* triangleConnectionTables = MeshGenLookup.GetTriangleConnectionTables();
+
+            float3 voxSize = this.voxSize;
+            float3 minPos = new(69420.0f, 69420.0f, 69420.0f);
+            float3 maxPos = -minPos;
             vers.Clear();
             tris.Clear();
             nors.Clear();
 
             for (int vI = 0; vI < vCountXYZ; vI++)
             {
-                Vector3 posL = VoxIndexToPosL(vI);
+                float3 posL = VoxIndexToPosL(vI);
                 int cubeIndex = 0;
                 int vMaxX = vCountX - 1;
                 int vMaxY = vCountY - 1;
@@ -306,44 +318,35 @@ namespace zombGen
                     cubeIndex |= 1 << i;
                 }
 
-                int edgeFlag = MeshGenLookup.CubeEdgeFlags[cubeIndex];
+                int edgeFlag = cubeEdgeFlags[cubeIndex];
                 if (edgeFlag == 0) continue;
 
                 for (int i = 0; i < 12; i++)
                 {
                     //if there is an intersection on this edge
-                    if ((edgeFlag & (1 << i)) != 0)
-                    {
-                        float offset = GetOffset(cubeValues[MeshGenLookup.EdgeConnection[i, 0]],
-                            cubeValues[MeshGenLookup.EdgeConnection[i, 1]]);
+                    if ((edgeFlag & (1 << i)) == 0) continue;
+                    int2 edgeCon = edgeConnections[i];
+                    float offset = GetOffset(cubeValues[edgeCon.x],
+                        cubeValues[edgeCon.y]);
 
-                        edgeVertex[i].x = posL.x
-                            + ((MeshGenLookup.VertexOffset[MeshGenLookup.EdgeConnection[i, 0], 0]
-                            + offset * MeshGenLookup.EdgeDirection[i, 0]) * voxSize.x);
-                        edgeVertex[i].y = posL.y
-                            + ((MeshGenLookup.VertexOffset[MeshGenLookup.EdgeConnection[i, 0], 1]
-                            + offset * MeshGenLookup.EdgeDirection[i, 1]) * voxSize.y);
-                        edgeVertex[i].z = posL.z
-                            + ((MeshGenLookup.VertexOffset[MeshGenLookup.EdgeConnection[i, 0], 2]
-                            + offset * MeshGenLookup.EdgeDirection[i, 2]) * voxSize.z);
-                    }
+                    edgeVertex[i] = posL + ((vertexOffsets[edgeCon.x] + offset * edgeDirections[i]) * voxSize);
                 }
 
-                for (int i = 0; i < 5; i++)
+                int cubeIndex_tri = cubeIndex * 16;
+                for (int i = 0; i < 12; i += 3)
                 {
-                    if (MeshGenLookup.TriangleConnectionTable[cubeIndex, 3 * i] < 0) break;
+                    if (triangleConnectionTables[cubeIndex_tri + i] < 0) break;
 
-                    Vector3 ev0 = edgeVertex[MeshGenLookup.TriangleConnectionTable[cubeIndex, 3 * i]];
-                    Vector3 ev1 = edgeVertex[MeshGenLookup.TriangleConnectionTable[cubeIndex, (3 * i) + 1]];
-                    Vector3 ev2 = edgeVertex[MeshGenLookup.TriangleConnectionTable[cubeIndex, (3 * i) + 2]];
-                    minPos = Vector3.Min(minPos, Vector3.Min(Vector3.Min(ev0, ev1), ev2));
-                    maxPos = Vector3.Max(maxPos, Vector3.Max(Vector3.Max(ev0, ev1), ev2));
-
+                    float3 ev0 = edgeVertex[triangleConnectionTables[cubeIndex_tri + i]];
+                    float3 ev1 = edgeVertex[triangleConnectionTables[cubeIndex_tri + i + 1]];
+                    float3 ev2 = edgeVertex[triangleConnectionTables[cubeIndex_tri + i + 2]];
+                    minPos = math.min(minPos, math.min(ev0, math.min(ev1, ev2)));
+                    maxPos = math.max(minPos, math.max(ev0, math.max(ev1, ev2)));
                     vers.Add(ev0);
                     vers.Add(ev1);
                     vers.Add(ev2);
 
-                    Vector3 nor = Vector3.Normalize(Vector3.Cross(ev1 - ev2, ev0 - ev2));
+                    Vector3 nor = math.normalize(math.cross(ev1 - ev2, ev0 - ev2));
                     nors.Add(nor);//Cross order is reversed as tri order
                     nors.Add(nor);
                     nors.Add(nor);
@@ -366,21 +369,36 @@ namespace zombGen
             md.SetVertexBufferParams(vers.Length, layout);
             md.SetIndexBufferParams(tris.Length, IndexFormat.UInt32);
             md.subMeshCount = 1;
-            vers.AsArray().CopyTo(md.GetVertexData<Vector3>(0));
-            nors.AsArray().CopyTo(md.GetVertexData<Vector3>(1));
-            tris.AsArray().CopyTo(md.GetIndexData<uint>());
+            UnsafeUtility.MemCpy(md.GetVertexData<Vector3>(0).GetUnsafePtr(),
+                vers.GetUnsafeReadOnlyPtr(), vers.Length * sizeof(float3));
+            UnsafeUtility.MemCpy(md.GetVertexData<Vector3>(1).GetUnsafePtr(),
+                nors.GetUnsafeReadOnlyPtr(), nors.Length * sizeof(float3));
+            UnsafeUtility.MemCpy(md.GetIndexData<uint>().GetUnsafePtr(),
+                tris.GetUnsafeReadOnlyPtr(), tris.Length * sizeof(uint));
             md.SetSubMesh(0, new(0, tris.Length, MeshTopology.Triangles));
+
+            //Dispose
             layout.Dispose();
+            UnsafeUtility.Free(cubeValues, Allocator.Temp);
+            UnsafeUtility.Free(edgeVertex, Allocator.Temp);
+            UnsafeUtility.Free(offsets, Allocator.Temp);
+            UnsafeUtility.Free(cubeEdgeFlags, Allocator.Temp);
+            UnsafeUtility.Free(edgeConnections, Allocator.Temp);
+            UnsafeUtility.Free(edgeDirections, Allocator.Temp);
+            UnsafeUtility.Free(vertexOffsets, Allocator.Temp);
+            UnsafeUtility.Free(triangleConnectionTables, Allocator.Temp);
         }
 
-        public readonly Vector3 VoxIndexToPosL(int voxI)
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public readonly float3 VoxIndexToPosL(int voxI)
         {
             int remainderAfterZ = voxI % vCountYZ;
-            return new Vector3((voxI / vCountYZ) * voxSize.x,
+            return new float3((voxI / vCountYZ) * voxSize.x,
                 (remainderAfterZ / vCountZ) * voxSize.y,
                 (remainderAfterZ % vCountZ) * voxSize.z) + start;
         }
 
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public readonly float GetOffset(float v1, float v2)
         {
             float delta = v2 - v1;
