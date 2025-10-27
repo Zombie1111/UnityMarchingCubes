@@ -9,67 +9,64 @@ using UnityEngine.Rendering;
 
 namespace zombGen
 {
-    public readonly unsafe struct MarchingObject
+    public unsafe struct MarchingObject
     {
-        public readonly float* voxs;
-        public readonly float3 start;
-        public readonly float3 voxSize;
-        public readonly float surface;
+        public float* voxs;
+        public byte* voxsState;
+        public float3 start;
+        public float3 voxSize;
+        public float surface;
 
-        public readonly NativeList<uint> tris;
-        public readonly NativeList<float3> vers;
-        public readonly NativeList<float3> nors;
+        public NativeList<uint> tris;
+        public NativeList<float3> vers;
+        public NativeList<float3> nors;
 
         /// <summary>
         /// Lenght of voxs, -1 if invalid
         /// </summary>
-        public readonly int vCountXYZ;
-        public readonly int vCountYZ;
-        public readonly int vCountZ;
-        public readonly int vCountY;
-        public readonly int vCountX;
+        public int vCountXYZ;
+        public int vCountYZ;
+        public int vCountZ;
+        public int vCountY;
+        public int vCountX;
+
+        /// <summary>
+        /// Voxel indexs of removed or created voxels (Negative if removed)
+        /// DONT forget to clear
+        /// </summary>
+        public NativeList<int> addedRemovedVoxsI;
 
         #region Voxelization
 
         /// <summary>
         /// DO NOT ACCESS this after disposing (Returns new cleared VoxObject)
         /// </summary>
-        public MarchingObject Dispose()
+        public void Dispose()
         {
-            if (vCountXYZ < 0) return this;
+            if (vCountXYZ < 0) return;
+            vCountXYZ = -1;
 
             UnsafeUtility.Free(voxs, Allocator.Persistent);
+            UnsafeUtility.Free(voxsState, Allocator.Persistent);
             tris.Dispose();
             vers.Dispose();
             nors.Dispose();
-            return new(true);
-        }
+            addedRemovedVoxsI.Dispose();
+            newMO.Value.Dispose();
+            newMO.Dispose();
+            voxsToCheck.Dispose();
 
-        private MarchingObject(bool unused)
-        {
-            voxs = null;
-            start = Vector3.zero;
-            voxSize = Vector3.zero;
-            surface = 0.0f;
-
-            tris = new();
-            vers = new();
-            nors = new();
-
-            vCountXYZ = -1;
-            vCountYZ = -1;
-            vCountZ = -1;
-            vCountY = -1;
-            vCountX = -1;
         }
 
         /// <summary>
         /// Voxelizes the given collider. (Mainthread only)
         /// DONT FORGET TO CALL this.Dispose() in OnDestroy or similar
         /// </summary>
-        public MarchingObject(Collider col, bool tryFillConvaveInteriors = true, bool tryStripOuterLayer = false,
+        public MarchingObject(Collider col, Collider kin = null, bool tryFillConvaveInteriors = true, bool tryStripOuterLayer = false,
             float surface = 0.0f, float isoLevel = 1.0f)
         {
+            lToW = col.transform.localToWorldMatrix;
+
             Quaternion ogRot = col.transform.rotation;
             col.transform.rotation = Quaternion.identity;
             col.enabled = false;
@@ -90,7 +87,14 @@ namespace zombGen
             Vector3 bStart = colBounds.min - voxelSize;
             Vector3 bMax = colBounds.max;
             int ogLayer = col.gameObject.layer;
+            int kinOgLayer = kin == null ? 0 : kin.gameObject.layer;
+            bool kinEnabled = kin != null && kin.gameObject.activeSelf;
             col.gameObject.layer = MeshGenGlobals.voxelizeTempLayer;
+            if (kin != null)
+            {
+                kin.gameObject.layer = MeshGenGlobals.voxelizeTempLayer;
+                kin.gameObject.SetActive(true);
+            }
             if (ogLayer == MeshGenGlobals.voxelizeTempLayer) Debug.LogWarning(col.transform.name + " already had voxelizeTempLayer layer, not recommended");
             LayerMask layerMask = 1 << MeshGenGlobals.voxelizeTempLayer;
             PhysicsScene colPhyScene = col.gameObject.scene.GetPhysicsScene();
@@ -100,9 +104,10 @@ namespace zombGen
             Vector3 voxelSizeHalfReal = voxelSize * 0.5f;
             int vCountXYZ = vCountX * vCountY * vCountZ;
             float* voxs = null;
+            byte* voxsState = null;
             int overlappingVoxCount = 0;
 
-            if (vCountXYZ <= 0)
+            if (vCountXYZ < 9)
             {
                 vCountXYZ = -1;
                 Debug.LogWarning(col.transform.name + " wont contain any voxels! Is the object too small?");
@@ -142,20 +147,23 @@ namespace zombGen
 
             //Check result
             int colId = col.GetInstanceID();
+            int kinId = kin == null ? 0 : kin.GetInstanceID();
 
             voxs = (float*)UnsafeUtility.Malloc(vCountXYZ * sizeof(float),
                 UnsafeUtility.AlignOf<float>(), Allocator.Persistent);
+            voxsState = (byte*)UnsafeUtility.Malloc(vCountXYZ * sizeof(byte),
+                UnsafeUtility.AlignOf<byte>(), Allocator.Persistent);
+            UnsafeUtility.MemClear(voxsState, vCountXYZ * sizeof(byte));
 
             Parallel.For(0, vCountXYZ, vI =>
             {
                 int maxRI = (vI * MeshGenGlobals.voxelizeMaxHits) + MeshGenGlobals.voxelizeMaxHits;
                 for (int rI = vI * MeshGenGlobals.voxelizeMaxHits; rI < maxRI; rI++)
                 {
-                    if (results[rI].instanceID != colId) continue;
-                    if (vI < 0 || vI >= vCountXYZ)
-                    {
-                        continue;
-                    }
+                    int id = results[rI].instanceID;
+                    if (id == kinId) voxsState[vI] = MeshGenGlobals.kinVoxFlag;
+                    if (id != colId) continue;
+
 
                     voxs[vI] = isoLevel;
                     overlappingVoxCount++;
@@ -256,6 +264,7 @@ namespace zombGen
         SkipCreation:;
 
             this.voxs = voxs;
+            this.voxsState = voxsState;
             start = colWToL.MultiplyPoint3x4(bStart);
             voxSize = inverseScale * MeshGenGlobals.voxelSizeWorld;
             this.vCountXYZ = vCountXYZ;
@@ -265,12 +274,21 @@ namespace zombGen
             this.vCountX = vCountX;
             this.surface = surface;
 
+            addedRemovedVoxsI = new(overlappingVoxCount, Allocator.Persistent);
+            newMO = new(new(vCountXYZ), Allocator.Persistent);
+            voxsToCheck = new(16, Allocator.Persistent);
+
             int initialVerCount = overlappingVoxCount * 5 * 3;
             tris = new NativeList<uint>(initialVerCount, Allocator.Persistent);
             vers = new NativeList<float3>(initialVerCount, Allocator.Persistent);
             nors = new NativeList<float3>(initialVerCount, Allocator.Persistent);
-
+            
             col.gameObject.layer = ogLayer;
+            if (kin != null)
+            {
+                kin.gameObject.layer = kinOgLayer;
+                kin.gameObject.SetActive(kinEnabled);
+            }
             col.transform.rotation = ogRot;
         }
         #endregion Voxelization
@@ -287,6 +305,7 @@ namespace zombGen
 
             //We could persistent allocate these in a readonly struct and pass along that, worth it?
             int* offsets = MeshGenLookup.GetOffsets(vCountZ, vCountYZ);
+            int* offsetsAll = MeshGenLookup.GetOffsetsAll(vCountZ, vCountYZ);
             int* cubeEdgeFlags = MeshGenLookup.GetCubeEdgeFlags();
             int2* edgeConnections = MeshGenLookup.GetEdgeConnections();
             float3* edgeDirections = MeshGenLookup.GetEdgeDirections();
@@ -296,6 +315,7 @@ namespace zombGen
             float3 voxSize = this.voxSize;
             float3 minPos = new(69420.0f, 69420.0f, 69420.0f);
             float3 maxPos = -minPos;
+            bool hadMesh = vers.Length > 2; 
             vers.Clear();
             tris.Clear();
             nors.Clear();
@@ -311,13 +331,6 @@ namespace zombGen
                 for (int i = 0; i < 8; i++)
                 {
                     int nVI = vI + offsets[i];
-                    //int remainderAfterZ = nVI % vCountYZ;
-                    //int x = nVI / vCountYZ;
-                    //int y = remainderAfterZ / vCountZ;
-                    //int z = remainderAfterZ % vCountZ;
-                    //if (x < 0 || x > vMaxX
-                    //    || y < 0 || y > vMaxY
-                    //    || z < 0 || z > vMaxZ)
                     if (IsVoxIndexInBounds(nVI) == false)
                     {//Bounds check
                         cubeValues[i] = -1.0f;
@@ -325,11 +338,25 @@ namespace zombGen
                     }
 
                     cubeValues[i] = voxs[nVI];
-                    if (voxs[nVI] >= surface) cubeIndex |= 1 << i;
+                    if (IsVoxIndexSolid(nVI) == true)
+                        cubeIndex |= 1 << i;
                 }
 
                 int edgeFlag = cubeEdgeFlags[cubeIndex];
-                if (edgeFlag == 0) continue;
+                if (edgeFlag == 0)
+                {
+                    if ((voxsState[vI] & ~MeshGenGlobals.kinVoxFlag) == 0) continue;
+                    voxsState[vI] &= MeshGenGlobals.kinVoxFlag;
+                    addedRemovedVoxsI.Add(-vI);
+
+                    //for (int i = 0; i < 14; i++)
+                    //{
+                    //    if (voxsToCheck.Contains(vI + offsetsAll[i]) == false)
+                    //        voxsToCheck.Add(vI + offsetsAll[i]);
+                    //}
+
+                    continue;
+                }
 
                 for (int i = 0; i < 12; i++)
                 {
@@ -342,6 +369,7 @@ namespace zombGen
                     edgeVertex[i] = posL + ((vertexOffsets[edgeCon.x] + offset * edgeDirections[i]) * voxSize);
                 }
 
+                float3 totNor = float3.zero;
                 int cubeIndex_tri = cubeIndex * 16;
                 for (int i = 0; i < 16; i += 3)
                 {
@@ -356,15 +384,38 @@ namespace zombGen
                     vers.Add(ev1);
                     vers.Add(ev2);
 
-                    Vector3 nor = math.normalize(math.cross(ev1 - ev2, ev0 - ev2));
+                    float3 nor = math.normalize(math.cross(ev1 - ev2, ev0 - ev2));
                     nors.Add(nor);//Cross order is reversed as tri order
                     nors.Add(nor);
                     nors.Add(nor);
+                    totNor += nor;
 
                     uint idx = (uint)tris.Length;
                     tris.Add(idx + 2);
                     tris.Add(idx + 1);
                     tris.Add(idx);
+                }
+
+                //Could be precomputed in lookup table based on cubeIndex
+                byte prevState = voxsState[vI];
+                byte newState = (byte)((1 << 0) | (prevState & MeshGenGlobals.kinVoxFlag));
+                if (totNor.x < 0.0f) newState |= 1 << 1;
+                if (totNor.y < 0.0f) newState |= 1 << 2;
+                if (totNor.z < 0.0f) newState |= 1 << 3;
+
+                if (prevState == newState) continue;
+                voxsState[vI] = newState;
+                addedRemovedVoxsI.Add(vI);
+
+                //if ((prevState & ~MeshGenGlobals.kinVoxFlag) == 0 && hadMesh == true)
+                if (hadMesh == true)
+                {
+                    int vI2 = vI;
+                    if ((newState & (1 << 1)) != 0) vI2 += vCountYZ;
+                    if ((newState & (1 << 2)) != 0) vI2 += vCountZ;
+                    if ((newState & (1 << 3)) != 0) vI2 += 1;
+                    if (voxsToCheck.Contains(vI2) == false)
+                        voxsToCheck.Add(vI2);
                 }
             }
 
@@ -392,6 +443,7 @@ namespace zombGen
             UnsafeUtility.Free(cubeValues, Allocator.Temp);
             UnsafeUtility.Free(edgeVertex, Allocator.Temp);
             UnsafeUtility.Free(offsets, Allocator.Temp);
+            UnsafeUtility.Free(offsetsAll, Allocator.Temp);
             UnsafeUtility.Free(cubeEdgeFlags, Allocator.Temp);
             UnsafeUtility.Free(edgeConnections, Allocator.Temp);
             UnsafeUtility.Free(edgeDirections, Allocator.Temp);
@@ -460,6 +512,18 @@ namespace zombGen
             return (delta == 0.0f) ? surface : (surface - v1) / delta;
         }
 
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public readonly bool IsVoxIndexSolid(int voxI)
+        {
+            return voxs[voxI] >= surface;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public readonly bool IsVoxIndexKinematic(int voxI)
+        {
+            return (voxsState[voxI] & MeshGenGlobals.kinVoxFlag) != 0;
+        }
+
         #endregion Base Helpers
 
         #region Methods
@@ -470,7 +534,8 @@ namespace zombGen
             int maxY = Mathf.CeilToInt(radiusLocal * voxSize.y);
             int maxZ = Mathf.CeilToInt(radiusLocal * voxSize.z);
             float radiusSQ = radiusLocal * radiusLocal;
-            int margin = newValue >= surface ? 1 : 0;
+            bool newSolid = newValue >= surface;
+            int margin = newSolid == true ? 1 : 0;
             //Margin when creating as marching cubes requires 1 row of empty voxels to work properly
 
             for (int z = -maxZ; z <= maxZ; z++)
@@ -486,6 +551,8 @@ namespace zombGen
 
                         int vI = voxI + z + (vCountZ * y) + (vCountYZ * x);
                         if (IsVoxIndexInBounds(vI, margin) == false) continue;
+                        //if (IsVoxIndexSolid(vI) != newSolid)
+                        //    addedRemovedVoxsI.Add(newSolid == true ? vI : -vI);
                         voxs[vI] = newValue;
                     }
                 }
@@ -504,6 +571,226 @@ namespace zombGen
             SetVoxelsAround(PosLToVoxIndex(posL), radiusLocal, 1.0f);
         }
         #endregion Methods
+
+        #region Physics
+
+        public NativeList<int> voxsToCheck;
+        public NativeReference<Unmanaged> newMO;
+        public Matrix4x4 lToW;
+
+        public void TryGetChunk()
+        {
+        TryAgain:;
+            if (voxsToCheck.Length == 0) return;
+            int voxI = voxsToCheck[^1];
+            voxsToCheck.RemoveAt(voxsToCheck.Length - 1);
+
+            if (IsVoxIndexSolid(voxI) == false)
+            {
+                goto TryAgain;
+            }
+
+            int maxSpread = MeshGenGlobals.maxChunkCheckRadius - 2;
+            int maxLoops = maxSpread * maxSpread * maxSpread;
+            NativeParallelHashSet<int> voxsSearched = new(maxLoops, Allocator.Temp);
+            NativeQueue<int> toSearch = new(Allocator.Temp);
+            int* offsets = MeshGenLookup.GetOffsetsStraight(vCountZ, vCountYZ);
+            toSearch.Enqueue(voxI);
+            int loopCount = 0;
+            bool isKin = false;
+
+            while (loopCount++ < maxLoops && toSearch.TryDequeue(out int vI) == true)
+            {
+                for (int i = 0; i < 6; i++)
+                {
+                    int nVI = vI + offsets[i];
+                    if (IsVoxIndexInBounds(nVI) == false) continue;
+                    if (IsVoxIndexSolid(nVI) == false) continue;
+                    if (voxsSearched.Add(nVI) == false) continue;
+
+                    //if (loopCount < 108)//As stuff likely changed in the same area, only check in the first few iterations 
+                    {
+                        int toCheckI = voxsToCheck.IndexOf(nVI);
+                        if (toCheckI >= 0) voxsToCheck.RemoveAtSwapBack(toCheckI);
+                    }
+
+                    if (IsVoxIndexKinematic(nVI) == true)
+                    {
+                        isKin = true;
+                        continue;
+                    }
+
+                    Debug.DrawLine(lToW.MultiplyPoint3x4(VoxIndexToPosL(vI)), lToW.MultiplyPoint3x4(VoxIndexToPosL(nVI)), Color.red, 0.1f, true);
+                    toSearch.Enqueue(nVI);
+                }
+            }
+
+            int searchedCount = voxsSearched.Count();
+            toSearch.Dispose();
+            UnsafeUtility.Free(offsets, Allocator.Temp);
+            if (loopCount >= maxLoops || isKin == true)
+            {
+                voxsSearched.Dispose();
+                return;
+            }
+
+            //We have a disconnected chunk, create a new MarchingObject for it
+            //newMO.Value = new(in this, voxsSearched);
+            Unmanaged newMO = this.newMO.Value;
+            newMO.SetFrom(in this, voxsSearched);
+            this.newMO.Value = newMO;
+            voxsSearched.Dispose();
+        }
+
+        public unsafe struct Unmanaged
+        {
+            public float* voxs;
+            public byte* voxsState;
+            public float3 start;
+            public float3 voxSize;
+            public float surface;
+
+            /// <summary>
+            /// Lenght of voxs, -1 if invalid
+            /// </summary>
+            public int maxVCountXYZ;
+            public int vCountXYZ;
+            public int vCountYZ;
+            public int vCountZ;
+            public int vCountY;
+            public int vCountX;
+
+            public int overlappingVoxCount;
+
+            public void Dispose()
+            {
+                if (maxVCountXYZ < 0) return;
+                maxVCountXYZ = -1;
+                UnsafeUtility.Free(voxs, Allocator.Persistent);
+                UnsafeUtility.Free(voxsState, Allocator.Persistent);
+            }
+
+            public Unmanaged(int vCountXYZ)
+            {
+                maxVCountXYZ = Mathf.Min(vCountXYZ, MeshGenGlobals.maxChunkCheckRadius
+                    * MeshGenGlobals.maxChunkCheckRadius
+                    * MeshGenGlobals.maxChunkCheckRadius);
+                if (maxVCountXYZ < 9) throw new Exception("Bad input " + vCountXYZ);
+
+                this.vCountXYZ = -1;
+                vCountYZ = -1;
+                vCountZ = -1;
+                vCountY = -1;
+                vCountX = -1;
+                overlappingVoxCount = -1;
+
+                start = float3.zero;
+                voxSize = float3.zero;
+                surface = 0.0f;
+
+                voxs = (float*)UnsafeUtility.Malloc(maxVCountXYZ * sizeof(float),
+                    UnsafeUtility.AlignOf<float>(), Allocator.Persistent);
+                voxsState = (byte*)UnsafeUtility.Malloc(maxVCountXYZ * sizeof(byte),
+                    UnsafeUtility.AlignOf<byte>(), Allocator.Persistent);
+            }
+
+            internal void SetFrom(in MarchingObject mo, NativeParallelHashSet<int> voxsSearched)
+            {
+                //Get bounds
+                NativeArray<float3> voxsPos = new(voxsSearched.Count(), Allocator.Temp, NativeArrayOptions.UninitializedMemory);
+                float3 bMin = new(69420.0f, 69420.0f, 69420.0f);
+                float3 bMax = -bMin;
+                int i = 0;
+
+                foreach (int vI in voxsSearched)
+                {
+                    float3 posL = mo.VoxIndexToPosL(vI);
+                    bMin = math.min(posL, bMin);
+                    bMax = math.max(posL, bMax);
+                    voxsPos[i++] = posL;
+                }
+
+                float3 voxelSize = mo.voxSize;
+                float3 bSize = (bMax - bMin) + (voxelSize * 2);
+                float3 bStart = bMin - voxelSize;
+
+                //Vector3 voxelSize = MeshGenGlobals.voxelSizeWorld * Vector3.one;
+                //Bounds colBounds = col.bounds;
+                //Matrix4x4 colWToL = col.transform.worldToLocalMatrix;
+                //Vector3 inverseScale = col.transform.lossyScale;
+                //inverseScale = new Vector3(1.0f / inverseScale.x, 1.0f / inverseScale.y, 1.0f / inverseScale.z);
+                //
+                //Vector3 bSize = colBounds.size + (voxelSize * 2.0f);
+                vCountX = (int)Math.Ceiling(bSize.x / voxelSize.x);
+                vCountY = (int)Math.Ceiling(bSize.y / voxelSize.y);
+                vCountZ = (int)Math.Ceiling(bSize.z / voxelSize.z);
+                vCountYZ = vCountY * vCountZ;
+                vCountXYZ = vCountX * vCountY * vCountZ;
+                voxSize = mo.voxSize;
+                surface = mo.surface;
+                start = bStart;
+                overlappingVoxCount = voxsPos.Length;
+
+                if (vCountXYZ < 9 || vCountXYZ > maxVCountXYZ)
+                {
+                    overlappingVoxCount = -1;
+                    return;
+                }
+
+                foreach (int vI in voxsSearched)
+                {
+                    mo.voxs[vI] = -1.0f;//Remove voxel from source
+                }
+
+                float fill = -1.0f;
+                UnsafeUtility.MemCpyReplicate(voxs, &fill, sizeof(float), vCountXYZ);
+                UnsafeUtility.MemClear(voxsState, vCountXYZ * sizeof(byte));
+
+                float3 offset = bStart - mo.start;
+                foreach (float3 vPos in voxsPos)
+                {
+                    float3 snappedPos = (vPos - mo.start) - offset;
+                    int vI = (int)(snappedPos.z / voxSize.z)
+                        + ((int)(snappedPos.y / voxSize.y) * vCountZ)
+                        + ((int)(snappedPos.x / voxSize.x) * vCountYZ);
+                
+                    voxs[vI] = 1.0f;
+                }
+
+                voxsPos.Dispose();
+            }
+        }
+
+        public MarchingObject(in Unmanaged mo)
+        {
+            if (mo.overlappingVoxCount <= 0) throw new Exception("Bad Unmanaged overlappingVoxCount");
+
+            start = mo.start;
+            voxSize = mo.voxSize;
+            surface = mo.surface;
+            vCountXYZ = mo.vCountXYZ;
+            vCountYZ = mo.vCountYZ;
+            vCountZ = mo.vCountZ;
+            vCountY = mo.vCountY;
+            vCountX = mo.vCountX;
+
+            voxs = (float*)UnsafeUtility.Malloc(sizeof(float) * vCountXYZ, UnsafeUtility.AlignOf<float>(), Allocator.Persistent);
+            UnsafeUtility.MemCpy(voxs, mo.voxs, sizeof(float) * vCountXYZ);
+            voxsState = (byte*)UnsafeUtility.Malloc(sizeof(byte) * vCountXYZ, UnsafeUtility.AlignOf<byte>(), Allocator.Persistent);
+            UnsafeUtility.MemClear(voxsState, sizeof(byte) * vCountXYZ);
+
+            addedRemovedVoxsI = new(mo.overlappingVoxCount, Allocator.Persistent);
+            newMO = new(new(vCountXYZ), Allocator.Persistent);
+            voxsToCheck = new(16, Allocator.Persistent);
+            lToW = Matrix4x4.identity;
+
+            int initialVerCount = mo.overlappingVoxCount * 5 * 3;
+            tris = new NativeList<uint>(initialVerCount, Allocator.Persistent);
+            vers = new NativeList<float3>(initialVerCount, Allocator.Persistent);
+            nors = new NativeList<float3>(initialVerCount, Allocator.Persistent);
+        }
+
+        #endregion Physics
     }
 
     public static class MeshGenHelpers
@@ -521,6 +808,11 @@ namespace zombGen
         }
 
         public static float Average(this Vector3 vec)
+        {
+            return (vec.x + vec.y + vec.z) / 3.0f;
+        }
+
+        public static float Average(this float3 vec)
         {
             return (vec.x + vec.y + vec.z) / 3.0f;
         }

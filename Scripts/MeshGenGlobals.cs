@@ -16,6 +16,11 @@ namespace zombGen
 
         //Maximum allowed size of object is maxVoxelsInExtent * voxelSizeWorld
         public const int maxVoxelsInExtent = 128;
+
+        //Maximum volume of a chunk for it to disconnect is maxChunkCheckRadius^3
+        public const int maxChunkCheckRadius = 10;
+
+        public const byte kinVoxFlag = 1 << 7;
     }
 }
 

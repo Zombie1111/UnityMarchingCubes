@@ -5,8 +5,14 @@ using Unity.Collections;
 using Unity.Collections.LowLevel.Unsafe;
 using Unity.Jobs;
 using UnityEngine;
-using UnityEngine.Assertions.Must;
+using UnityEngine.Jobs;
 using UnityEngine.Rendering;
+using Codice.Client.BaseCommands.Annotate;
+
+
+#if UNITY_EDITOR
+using UnityEditor;
+#endif
 
 namespace zombGen
 {
@@ -20,9 +26,19 @@ namespace zombGen
         [SerializeField] private bool tryStripOuterLayer = false;
         [SerializeField] private float surfaceLevel = 0.0f;
         [SerializeField] private float isoLevel = 1.0f;
+        [Tooltip("Voxels overlapping with this will become kinematic")]
+        [SerializeField] private Collider kinematicVoxelsOverlap = null;
 
-        [Header("Runtime")]
+        [Header("Generic")]
+        [SerializeField] private Material mat = null;
         [SerializeField] private float minComputeTime = 0.05f;
+
+        [Header("Physics")]
+        [SerializeField] private bool usePrimitiveColliders = false;
+        [SerializeField] private float primitiveSizeFactor = 1.0f;
+        [SerializeField] private bool primitivePreferHoles = true;
+        [SerializeField] private PhysicMaterial phyMat = null;
+        [SerializeField] private float voxelMass = 0.1f;
 
         [Header("Debug")]
         [SerializeField] private bool drawStartShape = false;
@@ -57,12 +73,12 @@ namespace zombGen
                 int id = 0;
                 if (tryFillConvaveInteriors == true) id += 9823;
                 if (tryStripOuterLayer == true) id += 65;
+                if (usePrimitiveColliders == true) id += 545;
                 id += (int)(surfaceLevel * 1000.0f);
                 id += (int)(isoLevel * 1000.0f);
                 return id;
             }
         }
-
 
 #if UNITY_EDITOR
         private void OnValidate()
@@ -70,6 +86,11 @@ namespace zombGen
             if (lastShapeID == _currentShapeID
                 && lastConfigID == _currentConfigID) return;
 
+            EditorApplication.delayCall += OnValidateDelayed;
+        }
+
+        private void OnValidateDelayed()
+        {
             if (Application.isPlaying == true)
                 Debug.Log(transform.name + " regenerated MeshGen by OnValidate");
 
@@ -91,9 +112,9 @@ namespace zombGen
             lastShapeID = _currentShapeID;
             lastConfigID = _currentConfigID;
             col = this.GetOrAddComponent<MeshCollider>(out _);
-            mf = this.GetOrAddComponent<MeshFilter>(out _);
-            mr = this.GetOrAddComponent<MeshRenderer>(out _);
             col.sharedMesh = startShape;
+            col.enabled = true;
+
             MarchingObject mo;
 
             if (startShape != null) mo = NewMarchingObject(col);
@@ -109,14 +130,31 @@ namespace zombGen
 
             MarchingObject NewMarchingObject(Collider col)
             {
-                return new(col, tryFillConvaveInteriors, tryStripOuterLayer, surfaceLevel, isoLevel);
+                return new(col, kinematicVoxelsOverlap, tryFillConvaveInteriors, tryStripOuterLayer, surfaceLevel, isoLevel);
             }
 
             mesh = new();
             mesh.MarkDynamic();
-            col.sharedMesh = mesh;
-            mf.sharedMesh = mesh;
+            if (usePrimitiveColliders == false)
+            {
+                col.sharedMesh = mesh;
+                col.sharedMaterial = phyMat;
+            }
+            else
+            {
+                col.sharedMesh = null;
+                col.enabled = false;
+            }
 
+            mf = this.GetOrAddComponent<MeshFilter>(out _);
+            mr = this.GetOrAddComponent<MeshRenderer>(out _);
+            mf.sharedMesh = mesh;
+            mr.sharedMaterial = mat;
+
+            chunkBaseName = transform.name + "Chunk_";
+            primBaseLayer = gameObject.layer;
+            primBaseName = transform.name + "Prim_";
+            primBaseRadius = mo.voxSize.Average() / (2 / primitiveSizeFactor);
             pendingActionsA = new(8, Allocator.Persistent);
             pendingActionsB = new(8, Allocator.Persistent);
 
@@ -126,21 +164,26 @@ namespace zombGen
                 result = new(Allocator.Persistent)
             };
 
-            bm_job = new()
+            bc_job = new()
             {
                 meshID = mesh.GetInstanceID(),
                 convex = col.convex,
             };
 
             meshNeedsComputing = true;
+            if (usePrimitiveColliders == true)
+                OnVoxelsChanged += DoOnVoxelsChanged;
         }
 
         private void Dispose()
         {
             if (isInitilized == false) return;
-            isInitilized = false;
             ComputeMesh_end();
-            BakeMesh_end();
+            BakeCollision_end();
+            OnVoxelsChanged?.Invoke(ChangeType.disposing, _mo.addedRemovedVoxsI);
+            OnVoxelsChanged -= DoOnVoxelsChanged;
+            isInitilized = false;
+
             cm_job.mo.Dispose();
             cm_job.result.Dispose();
             pendingActionsA.Dispose();
@@ -148,7 +191,7 @@ namespace zombGen
             if (col != null) col.sharedMesh = null;
             mesh.Clear();
         }
-        
+
         private const MeshUpdateFlags _defaultUpdateFlags =
               MeshUpdateFlags.DontRecalculateBounds
             | MeshUpdateFlags.DontValidateIndices
@@ -162,6 +205,7 @@ namespace zombGen
             | MeshColliderCookingOptions.UseFastMidphase;
 
         private bool meshNeedsComputing = true;
+        private bool chunksNeedsComputing = true;
 
         private void Update()
         {
@@ -173,13 +217,13 @@ namespace zombGen
             }
 
             ComputeMesh_end();
-            if (meshNeedsComputing == true) ComputeMesh_start();
+            if (meshNeedsComputing == true || chunksNeedsComputing == true) ComputeMesh_start();
         }
 
         private void LateUpdate()
         {
             if (isInitilized == false) return;
-            BakeMesh_end();
+            BakeCollision_end();
         }
 
         private bool flipped = false;
@@ -193,6 +237,22 @@ namespace zombGen
             flipped = !flipped;
             _pendingActionsWrite.Clear();
         }
+
+        public enum ChangeType
+        {
+            removedCreated,
+            disposing,
+        }
+
+        public delegate void Event_OnVoxelsChanged(ChangeType type, NativeList<int> voxsRemovedCreated);
+        /// <summary>
+        /// if removedCreated: voxsRemovedCreated contains voxel indexs, negative if removed (Only read durring callback)
+        /// if initilized: all voxels currently solid was created
+        /// if disposing: all voxels currently solid will be removed
+        /// </summary>
+        public event Event_OnVoxelsChanged OnVoxelsChanged;
+
+        public MarchingObject _mo => cm_job.mo;
 
         public void PerformAction(Vector3 pos, float radius, Action.Type type)
         {
@@ -211,14 +271,23 @@ namespace zombGen
         {
             if (cm_isActive == true) return;
             cm_isActive = true;
+            bool chunksOnly = chunksNeedsComputing == true && meshNeedsComputing == false;
 
-            Flip();
-            cm_job.wToL = transform.worldToLocalMatrix;
-            cm_job.mda = Mesh.AllocateWritableMeshData(1);
-            cm_job.actions = _pendingActionsRead.AsArray().AsReadOnly();
-            cm_handle = bm_isActive == true ? cm_job.Schedule(bm_handle) : cm_job.Schedule();
-            timeSinceStartedComputing = 0.0f;
+            if (chunksOnly == false)
+            {
+                Flip();
+                cm_job.wToL = transform.worldToLocalMatrix;
+                cm_job.mda = Mesh.AllocateWritableMeshData(1);
+                cm_job.actions = _pendingActionsRead.AsArray().AsReadOnly();
+            }
+            else cm_job.mda = Mesh.AllocateWritableMeshData(0);
+
+            cm_job.chunksOnly = chunksOnly;
+            cm_handle = bc_isActive == true ? cm_job.Schedule(bc_handle) : cm_job.Schedule();
+
+            timeSinceStartedComputing = chunksOnly == false ? 0.0f : (minComputeTime / 2);
             meshNeedsComputing = false;
+            chunksNeedsComputing = false;
         }
 
         private void ComputeMesh_end()
@@ -226,17 +295,30 @@ namespace zombGen
             if (cm_isActive == false) return;
             cm_handle.Complete();
             cm_isActive = false;
+            bool wasChunksOnly = cm_job.chunksOnly;
 
-            ComputeMesh.Result result = cm_job.result.Value;
-            Mesh.ApplyAndDisposeWritableMeshData(cm_job.mda, mesh, _defaultUpdateFlags);
-            mesh.bounds = result.meshBoundsLocal;
+            if (wasChunksOnly == false)
+            {
+                ComputeMesh.Result result = cm_job.result.Value;
+                Mesh.ApplyAndDisposeWritableMeshData(cm_job.mda, mesh, _defaultUpdateFlags);
+                mesh.bounds = result.meshBoundsLocal;
 
-            BakeMesh_start();
+                if (_mo.addedRemovedVoxsI.Length > 0)
+                {
+                    OnVoxelsChanged?.Invoke(ChangeType.removedCreated, _mo.addedRemovedVoxsI);
+                    _mo.addedRemovedVoxsI.Clear();
+                }
+            }
+            else cm_job.mda.Dispose();
+            
+            if (_mo.voxsToCheck.Length > 0)
+                chunksNeedsComputing = true;
+
+            MarchingObject.Unmanaged mo = _mo.newMO.Value;
+            TryCreateChunkFrom(ref mo);
+            cm_job.mo.newMO.Value = mo;
+            if (wasChunksOnly == false) BakeCollision_start();
         }
-
-        private BakeMesh bm_job;
-        private JobHandle bm_handle;
-        private bool bm_isActive = false;
 
         public readonly struct Action
         {
@@ -276,43 +358,55 @@ namespace zombGen
             public Matrix4x4 wToL;
             public NativeReference<Result> result;
             public NativeArray<Action>.ReadOnly actions;
+            public bool chunksOnly;
 
             public void Execute()
             {
-                float avgScale = wToL.lossyScale.Average();
-
-                foreach (Action a in actions)
+                if (chunksOnly == false)
                 {
-                    int voxI = mo.PosLToVoxIndex(wToL.MultiplyPoint3x4(a.posW));
-                    mo.SetVoxelsAround(voxI, a.radiusW, a.type == Action.Type.remove ? -1 : 1);
+                    foreach (Action a in actions)
+                    {
+                        int voxI = mo.PosLToVoxIndex(wToL.MultiplyPoint3x4(a.posW));
+                        mo.SetVoxelsAround(voxI, a.radiusW, a.type == Action.Type.remove ? -1 : 1);
+                    }
+
+                    mo.Meshify(mda[0], out Bounds bl);
+                    result.Value = new(bl);
                 }
 
-                mo.Meshify(mda[0], out Bounds bl);
-                result.Value = new(bl);
+                mo.TryGetChunk();
             }
         }
 
-        private void BakeMesh_start()
-        {
-            if (bm_isActive == true || isInitilized == false) return;
+        #endregion ComputeMesh
 
-            bm_isActive = true;
-            bm_handle = bm_job.Schedule();
+        #region Collision
+
+        private BakeCollision bc_job;
+        private JobHandle bc_handle;
+        private bool bc_isActive = false;
+
+        private void BakeCollision_start()
+        {
+            if (bc_isActive == true || isInitilized == false || usePrimitiveColliders == true) return;
+
+            bc_isActive = true;
+            bc_handle = bc_job.Schedule();
         }
 
-        private void BakeMesh_end()
+        private void BakeCollision_end()
         {
-            if (bm_isActive == false) return;
-            bm_isActive = false;
+            if (bc_isActive == false) return;
+            bc_isActive = false;
 
-            bm_handle.Complete();
+            bc_handle.Complete();
             //mesh.MarkModified();//Does not do a shit
             col.sharedMesh = null;
             col.sharedMesh = mesh;//Seems to be the only way to get the collider to actually update
         }
 
         [BurstCompile]
-        private struct BakeMesh : IJob
+        private struct BakeCollision : IJob
         {
             public int meshID;
             public bool convex;
@@ -323,7 +417,117 @@ namespace zombGen
             }
         }
 
-        #endregion ComputeMesh
+        private readonly Queue<SphereCollider> inactiveCols = new(16);
+        private readonly Dictionary<int, SphereCollider> voxIToCol = new(64);
+        private string primBaseName = "meshGenObj_";
+        private int primBaseLayer = 0;
+        private float primBaseRadius = MeshGenGlobals.voxelSizeWorld;
+
+        private unsafe void DoOnVoxelsChanged(ChangeType type, NativeList<int> voxsRemovedCreated)
+        {
+            if (type == ChangeType.disposing)
+            {
+                bool playing = Application.isPlaying;
+                foreach (SphereCollider col in inactiveCols)
+                {
+                    if (playing == false) DestroyImmediate(col.gameObject);
+                    else Destroy(col.gameObject);
+                }
+
+                foreach (SphereCollider col in voxIToCol.Values)
+                {
+                    if (col == null) continue;
+                    if (playing == false) DestroyImmediate(col.gameObject);
+                    else Destroy(col.gameObject);
+                }
+
+                voxIToCol.Clear();
+                inactiveCols.Clear();
+                return;
+            }
+
+            int vCount = voxsRemovedCreated.Length;
+            for (int i = 0; i < vCount; i++)
+            {
+                int vI = voxsRemovedCreated[i];
+                bool created = vI >= 0;
+                vI = Mathf.Abs(vI);
+                SphereCollider col;
+
+                if (created == true)
+                {
+                    if (voxIToCol.TryGetValue(vI, out col) == false)
+                    {
+                        if (inactiveCols.TryDequeue(out col) == false)
+                        {
+                            GameObject newO = new(primBaseName + vI);
+                            newO.transform.SetParent(transform, false);
+                            newO.transform.localScale = Vector3.one;
+                            newO.layer = primBaseLayer;
+                            newO.hideFlags = HideFlags.DontSave;
+                            col = newO.AddComponent<SphereCollider>();
+                            col.sharedMaterial = phyMat;
+                            col.radius = primBaseRadius;
+                        }
+                        else
+                        {
+                            col.gameObject.SetActive(true);
+                        }
+
+                        voxIToCol.Add(vI, col);
+                    }
+                    else if (primitivePreferHoles == false) continue;//Only voxState changed
+
+                    if (primitivePreferHoles == true)
+                    {
+                        int vI2 = vI;
+                        byte vState = _mo.voxsState[vI];
+                        if ((vState & (1 << 1)) != 0) vI2 += _mo.vCountYZ;
+                        if ((vState & (1 << 2)) != 0) vI2 += _mo.vCountZ;
+                        if ((vState & (1 << 3)) != 0) vI2 += 1;
+
+                        col.transform.localPosition = _mo.VoxIndexToPosL(vI2);
+                    }
+                    else
+                    {
+                        col.transform.localPosition = _mo.VoxIndexToPosL(vI)
+                            + (_mo.voxSize * 0.5f);
+                    }
+
+                    continue;
+                }
+
+                if (voxIToCol.Remove(vI, out col) == false) continue;
+                col.gameObject.SetActive(false);
+                inactiveCols.Enqueue(col);
+            }
+        }
+
+        #endregion Collision
+
+        #region Chunks
+
+        private string chunkBaseName = "chunk_";
+        private int nextChunkCount = 0;
+
+        public unsafe void TryCreateChunkFrom(ref MarchingObject.Unmanaged mo)
+        {
+            if (mo.overlappingVoxCount <= 0) return;
+
+            Debug.Log("Got new chunk " + mo.vCountXYZ + " " + _mo.vCountXYZ);
+            meshNeedsComputing = true;
+
+            //Maintain voxCount, needed for rbMass
+            //GameObject newO = new(chunkBaseName + nextChunkCount++);
+            //Rigidbody rb = newO.AddComponent<Rigidbody>();
+            //rb.mass = voxelMass * mo.overlappingVoxCount;
+            //
+            //MeshGenObject mgo = newO.AddComponent<MeshGenObject>();
+
+            mo.overlappingVoxCount = -1;
+        }
+
+        #endregion Chunks
     }
 }
 

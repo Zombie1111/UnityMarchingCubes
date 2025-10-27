@@ -52,9 +52,10 @@ namespace zombGen {
                 prim.transform.position = hit.point;
                 prim.transform.localScale = Vector3.one * breakRadius;
 
-                if (Input.GetMouseButtonDown(0) == true)
+                if (Input.GetMouseButton(0) == true)
                 {
-                    if (hit.transform.TryGetComponent(out MeshGenObject mgo) == false) return;
+                    MeshGenObject mgo = hit.transform.GetComponentInParent<MeshGenObject>();
+                    if (mgo == null) return;
                     mgo.PerformAction(hit.point, breakRadius, MeshGenObject.Action.Type.remove);
                 }
             }

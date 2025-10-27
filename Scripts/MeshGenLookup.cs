@@ -7,6 +7,43 @@ using UnityEngine;
 
 public static class MeshGenLookup
 {
+    public static unsafe int* GetOffsetsAll(int vCountZ, int vCountYZ)
+    {
+        int* ptr = (int*)UnsafeUtility.Malloc(14 * sizeof(int),
+            UnsafeUtility.AlignOf<int>(), Allocator.Temp);
+
+        ptr[0] = 1;
+        ptr[1] = -1;
+        ptr[2] = vCountZ;
+        ptr[3] = -vCountZ;
+        ptr[4] = vCountYZ;
+        ptr[5] = -vCountYZ;
+
+        ptr[6] = 1 + vCountZ + vCountYZ;
+        ptr[7] = 1 + -vCountZ + vCountYZ;
+        ptr[8] = 1 + vCountZ + -vCountYZ;
+        ptr[9] = 1 + -vCountZ + -vCountYZ;
+        ptr[10] = -1 + vCountZ + vCountYZ;
+        ptr[11] = -1 + -vCountZ + vCountYZ;
+        ptr[12] = -1 + vCountZ + -vCountYZ;
+        ptr[13] = -1 + -vCountZ + -vCountYZ;
+        return ptr;
+    }
+
+    public static unsafe int* GetOffsetsStraight(int vCountZ, int vCountYZ)
+    {
+        int* ptr = (int*)UnsafeUtility.Malloc(6 * sizeof(int),
+            UnsafeUtility.AlignOf<int>(), Allocator.Temp);
+
+        ptr[0] = 1;
+        ptr[1] = -1;
+        ptr[2] = vCountZ;
+        ptr[3] = -vCountZ;
+        ptr[4] = vCountYZ;
+        ptr[5] = -vCountYZ;
+        return ptr;
+    }
+
     public static unsafe int* GetOffsets(int vCountZ, int vCountYZ)
     {
         int* ptr = (int*)UnsafeUtility.Malloc(8 * sizeof(int),
