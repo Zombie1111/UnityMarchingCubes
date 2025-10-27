@@ -50,7 +50,7 @@ namespace zombGen
                 69420.0f, Physics.AllLayers, QueryTriggerInteraction.Ignore) == true)
             {
                 prim.transform.position = hit.point;
-                prim.transform.localScale = Vector3.one * breakRadius;
+                prim.transform.localScale = Vector3.one * breakRadius / 4;
 
                 if (Input.GetMouseButton(0) == true)
                 {

@@ -22,8 +22,8 @@ namespace zombGen
         [SerializeField] private Mesh startShape = null;
         [SerializeField] private bool tryFillConvaveInteriors = true;
         [SerializeField] private bool tryStripOuterLayer = false;
-        [SerializeField] private float surfaceLevel = 0.0f;
-        [SerializeField] private float isoLevel = 1.0f;
+        [SerializeField] private float surfaceLevel = 0.3f;
+        [SerializeField] private float isoLevel = 0.7f;
         [Tooltip("Voxels overlapping with this will become kinematic")]
         [SerializeField] private Collider kinematicVoxelsOverlap = null;
         [SerializeField] private bool smoothNormals = true;
@@ -57,7 +57,6 @@ namespace zombGen
 
         private void OnEnable()
         {
-            if (IsRuntimeCreated() == true) return;
             Init();
         }
 
@@ -86,14 +85,11 @@ namespace zombGen
 #if UNITY_EDITOR
         private void OnValidate()
         {
-            if (IsRuntimeCreated() == true) return;
+            if (isChunk == true || tempDisableInit == true) return;
             EditorApplication.delayCall += OnValidateDelayed;
         }
 
-        private bool IsRuntimeCreated()
-        {
-            return Application.isPlaying == true && gameObject.GetInstanceID() < 0;
-        }
+        private bool isChunk = false;
 
         private void OnValidateDelayed()
         {
@@ -101,6 +97,8 @@ namespace zombGen
             && lastConfigID == _currentConfigID)
             {
                 ComputeMesh_end();
+                if (col != null) col.sharedMaterial = phyMat;
+                if (mr != null) mr.sharedMaterial = mat;
                 cm_job.smoothNormals = smoothNormals;
                 meshNeedsComputing = true;
                 return;
@@ -153,9 +151,15 @@ namespace zombGen
                 col.enabled = true;
 
                 if (startShape != null) NewMarchingObject(col);
-                else if (TryGetComponent(out Collider othCol) == true && othCol.enabled == true && othCol != col)
+                else if (TryGetComponent(out Collider othCol) == true && othCol != col)
                 {
+                    bool wasEnabled = othCol.enabled;
+                    bool wasTrigger = othCol.isTrigger;
+                    othCol.isTrigger = false;
+                    othCol.enabled = true;
                     NewMarchingObject(othCol);
+                    othCol.enabled = wasEnabled;
+                    othCol.isTrigger = wasTrigger;
                 }
                 else
                 {
@@ -252,6 +256,7 @@ namespace zombGen
         private void Update()
         {
             if (isInitilized == false) return;
+            BakeCollision_end();
             if (usePrimitiveColliders == true) UpdatePrims();
             if (timeSinceStartedComputing < minComputeTime)
             {
@@ -269,11 +274,11 @@ namespace zombGen
             if (meshNeedsComputing == true || chunksNeedsComputing == true) ComputeMesh_start();
         }
 
-        private void LateUpdate()
-        {
-            if (isInitilized == false) return;
-            BakeCollision_end();
-        }
+        //private void LateUpdate()
+        //{
+        //    if (isInitilized == false) return;
+        //    BakeCollision_end();
+        //}
 
         private bool flipped = false;
         private NativeList<Action> pendingActionsA;
@@ -642,6 +647,7 @@ namespace zombGen
 
             MeshGenObject mgo = newO.GetComponent<MeshGenObject>();
             mgo.SetMO(new(mo));
+            mgo.isChunk = true;
             mgo.usePrimitiveColliders = true;
             mgo.interpolation = interpolation;
             mgo.mat = mat;
