@@ -1,7 +1,4 @@
-using System.Collections;
-using System.Collections.Generic;
-using UnityEngine;
-
+//Copyright 2025 David Westberg (MIT) https://github.com/Zombie1111/UnityMarchingCubes
 namespace zombGen
 {
     public static class MeshGenGlobals

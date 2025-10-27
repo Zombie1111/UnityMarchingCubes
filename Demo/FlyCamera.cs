@@ -1,7 +1,7 @@
 using UnityEngine;
-using System.Collections;
      
-namespace zombGen {
+namespace zombGen
+{
     public class FlyCamera : MonoBehaviour {
         bool isPaused = false;
         bool isPaused2 = false;

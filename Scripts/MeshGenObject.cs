@@ -1,4 +1,4 @@
-using System.Collections;
+//Copyright 2025 David Westberg (MIT) https://github.com/Zombie1111/UnityMarchingCubes
 using System.Collections.Generic;
 using Unity.Burst;
 using Unity.Collections;
@@ -7,10 +7,6 @@ using Unity.Jobs;
 using UnityEngine;
 using UnityEngine.Jobs;
 using UnityEngine.Rendering;
-using GluonGui.WorkspaceWindow.Views.WorkspaceExplorer.Explorer;
-using UnityEngine.UIElements;
-
-
 
 #if UNITY_EDITOR
 using UnityEditor;
@@ -21,7 +17,7 @@ namespace zombGen
     [ExecuteAlways]
     public class MeshGenObject : MonoBehaviour
     {
-        [Header("Setup")]
+        [Header("Generation")]
         [Tooltip("If null, tries to use collider attatch to this trans as shape")]
         [SerializeField] private Mesh startShape = null;
         [SerializeField] private bool tryFillConvaveInteriors = true;
@@ -30,6 +26,7 @@ namespace zombGen
         [SerializeField] private float isoLevel = 1.0f;
         [Tooltip("Voxels overlapping with this will become kinematic")]
         [SerializeField] private Collider kinematicVoxelsOverlap = null;
+        [SerializeField] private bool smoothNormals = true;
 
         [Header("Generic")]
         [SerializeField] private Material mat = null;
@@ -43,6 +40,7 @@ namespace zombGen
         [SerializeField] private PhysicMaterial phyMat = null;
         [SerializeField] private float voxelMass = 0.1f;
         [SerializeField] private RigidbodyInterpolation interpolation = RigidbodyInterpolation.Interpolate;
+        [SerializeField] private bool canBreak = true;
 
         [Header("Debug")]
         [SerializeField] private bool drawStartShape = false;
@@ -88,23 +86,29 @@ namespace zombGen
 #if UNITY_EDITOR
         private void OnValidate()
         {
-            if (lastShapeID == _currentShapeID
-                && lastConfigID == _currentConfigID) return;
-
+            if (IsRuntimeCreated() == true) return;
             EditorApplication.delayCall += OnValidateDelayed;
         }
 
         private bool IsRuntimeCreated()
         {
-
             return Application.isPlaying == true && gameObject.GetInstanceID() < 0;
         }
 
         private void OnValidateDelayed()
         {
+            if (lastShapeID == _currentShapeID
+            && lastConfigID == _currentConfigID)
+            {
+                ComputeMesh_end();
+                cm_job.smoothNormals = smoothNormals;
+                meshNeedsComputing = true;
+                return;
+            }
+
+
             if (Application.isPlaying == true)
             {
-                if (IsRuntimeCreated() == true) return;
                 Debug.Log(transform.name + " regenerated MeshGen by OnValidate");
             }
 
@@ -126,7 +130,9 @@ namespace zombGen
             cm_job = new()
             {
                 mo = newMO,
-                result = new(Allocator.Persistent)
+                result = new(Allocator.Persistent),
+                smoothNormals = smoothNormals,
+                canBreak = canBreak,
             };
 
             meshNeedsComputing = true;
@@ -249,7 +255,7 @@ namespace zombGen
             if (usePrimitiveColliders == true) UpdatePrims();
             if (timeSinceStartedComputing < minComputeTime)
             {
-                timeSinceStartedComputing += Time.deltaTime;
+                timeSinceStartedComputing += Time.unscaledDeltaTime;
                 return;
             }
 
@@ -310,6 +316,10 @@ namespace zombGen
                 cm_job.actions = _pendingActionsRead.AsArray().AsReadOnly();
             }
             else cm_job.mda = Mesh.AllocateWritableMeshData(0);
+
+#if UNITY_EDITOR
+            cm_job.mo.lToW = transform.localToWorldMatrix;
+#endif
 
             cm_job.chunksOnly = chunksOnly;
             cm_handle = bc_isActive == true ? cm_job.Schedule(bc_handle) : cm_job.Schedule();
@@ -406,6 +416,8 @@ namespace zombGen
             public NativeReference<Result> result;
             public NativeArray<Action>.ReadOnly actions;
             public bool chunksOnly;
+            public bool smoothNormals;
+            public bool canBreak;
 
             public void Execute()
             {
@@ -417,8 +429,14 @@ namespace zombGen
                         mo.SetVoxelsAround(voxI, a.radiusW, a.type == Action.Type.remove ? -1 : 1);
                     }
 
-                    mo.Meshify(mda[0], out Bounds bl);
+                    mo.Meshify(mda[0], smoothNormals, out Bounds bl);
                     result.Value = new(bl);
+                }
+
+                if (canBreak == false)
+                {
+                    mo.voxsToCheck.Clear();
+                    return;
                 }
 
                 mo.TryGetChunk();
@@ -569,6 +587,9 @@ namespace zombGen
                 }
             }
             else voxsToUpdate.Clear();
+
+            if (voxsToUpdate.Count == 0 && rb != null)//Freezing rb until all cols has been updated seems improve stability significantly
+                rb.constraints = RigidbodyConstraints.None;
         }
 
         private void UpdateRigidbody()
@@ -605,12 +626,13 @@ namespace zombGen
                 typeof(Rigidbody), typeof(MeshFilter), typeof(MeshRenderer));
             newO.transform.SetParent(transform.parent);
             newO.transform.localScale = transform.localScale;
-            transform.GetLocalPositionAndRotation(out Vector3 pos, out Quaternion rot);
-            newO.transform.SetLocalPositionAndRotation(pos, rot);
+            transform.GetPositionAndRotation(out Vector3 pos, out Quaternion rot);
+            newO.transform.SetPositionAndRotation(pos, rot);
             newO.layer = chunkBaseLayer;
 
             Rigidbody newRb = newO.GetComponent<Rigidbody>();
             newRb.interpolation = interpolation;
+            newRb.constraints = RigidbodyConstraints.FreezeAll;
             if (this.rb != null)
             {
                 newRb.velocity = this.rb.velocity;
@@ -631,6 +653,7 @@ namespace zombGen
             mgo.primitiveSizeFactor = primitiveSizeFactor;
             mgo.voxelMass = voxelMass;
             mgo.rb = newRb;
+            mgo.smoothNormals = smoothNormals;
 
             tempDisableInit = false;
             mgo.Init();//~30% of creation time is this ~0.085ms (Editor)
