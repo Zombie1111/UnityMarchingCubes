@@ -15,9 +15,11 @@ namespace zombGen
         public const int maxVoxelsInExtent = 128;
 
         //Maximum volume of a chunk for it to disconnect is maxChunkCheckRadius^3
-        public const int maxChunkCheckRadius = 10;
+        public const int maxChunkCheckRadius = 20;
 
         public const byte kinVoxFlag = 1 << 7;
+        public const byte delVoxFlag = 1 << 6;
+        public const byte kinDelVoxFlag = delVoxFlag | kinVoxFlag;
     }
 }
 

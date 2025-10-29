@@ -7,6 +7,7 @@ using Unity.Jobs;
 using UnityEngine;
 using UnityEngine.Jobs;
 using UnityEngine.Rendering;
+using Unity.Mathematics;
 
 #if UNITY_EDITOR
 using UnityEditor;
@@ -40,11 +41,27 @@ namespace zombGen
         [SerializeField] private PhysicMaterial phyMat = null;
         [SerializeField] private float voxelMass = 0.1f;
         [SerializeField] private RigidbodyInterpolation interpolation = RigidbodyInterpolation.Interpolate;
-        [SerializeField] private bool canBreak = true;
+
+        [Header("Breaking")]
+        [SerializeField] private BreakMode breakMode = BreakMode.rigidbody;
+        [SerializeField] private float forcePerBreakRadius = 40.0f;
+        [SerializeField] private int maxBreakRadius = 5;
+        [SerializeField] private float voxRemoveInterval = 0.01f;
+        [SerializeField] private float perVoxIntervalFactor = 0.03f;
+        //[SerializeField] private AudioReference breakAudio = new();
+        //private readonly AudioProps breakAudioProps = new();
+
+        public enum BreakMode
+        {
+            none,
+            rigidbody,
+            remove,
+        }
 
         [Header("Debug")]
         [SerializeField] private bool drawStartShape = false;
 
+        #region Main
 #if UNITY_EDITOR
         private void OnDrawGizmosSelected()
         {
@@ -78,6 +95,7 @@ namespace zombGen
                 if (usePrimitiveColliders == true) id += 545;
                 id += (int)(surfaceLevel * 1000.0f);
                 id += (int)(isoLevel * 1000.0f);
+                id += (int)breakMode * 46;
                 return id;
             }
         }
@@ -130,7 +148,7 @@ namespace zombGen
                 mo = newMO,
                 result = new(Allocator.Persistent),
                 smoothNormals = smoothNormals,
-                canBreak = canBreak,
+                breakMode = breakMode,
             };
 
             meshNeedsComputing = true;
@@ -169,7 +187,8 @@ namespace zombGen
 
                 void NewMarchingObject(Collider col)
                 {
-                    SetMO(new(col, kinematicVoxelsOverlap, tryFillConvaveInteriors, tryStripOuterLayer, surfaceLevel, isoLevel));
+                    SetMO(new(col, kinematicVoxelsOverlap, tryFillConvaveInteriors, tryStripOuterLayer,
+                        surfaceLevel, isoLevel, usePrimitiveColliders, breakMode));
                 }
             }
 
@@ -205,7 +224,7 @@ namespace zombGen
             chunkBaseLayer = gameObject.layer;
             primBaseLayer = gameObject.layer;
             primBaseName = transform.name + "Prim_";
-            primBaseRadius = _mo.voxSize.Average() / (2 / primitiveSizeFactor);
+            primBaseRadius = _mo.data.voxSize.Average() / (2 / primitiveSizeFactor);
             pendingActionsA = new(8, Allocator.Persistent);
             pendingActionsB = new(8, Allocator.Persistent);
 
@@ -218,6 +237,7 @@ namespace zombGen
             allMeshGenObjects.Add(this);
             meshNeedsComputing = true;
             timeSinceStartedComputing = 69420.0f;
+            //InitVoxels();
         }
 
         private void Dispose()
@@ -227,6 +247,7 @@ namespace zombGen
             BakeCollision_end();
             allMeshGenObjects.Remove(this);
             DisposePrims();
+            //DisposeVoxels();
             isInitilized = false;
 
             cm_job.mo.Dispose();
@@ -274,11 +295,9 @@ namespace zombGen
             if (meshNeedsComputing == true || chunksNeedsComputing == true) ComputeMesh_start();
         }
 
-        //private void LateUpdate()
-        //{
-        //    if (isInitilized == false) return;
-        //    BakeCollision_end();
-        //}
+        #endregion Main
+
+        #region API
 
         private bool flipped = false;
         private NativeList<Action> pendingActionsA;
@@ -300,12 +319,17 @@ namespace zombGen
             meshNeedsComputing = true;
         }
 
+        #endregion API
+
         #region ComputeMesh
 
         private ComputeMesh cm_job;
         private JobHandle cm_handle;
         private bool cm_isActive = false;
         private float timeSinceStartedComputing = 69420.0f;
+        private float timeAtLastCompute = 0.0f;
+        private float removeTimer = 0.0f;
+        private int lastToRemoveCount = 0;
 
         private void ComputeMesh_start()
         {
@@ -325,6 +349,14 @@ namespace zombGen
 #if UNITY_EDITOR
             cm_job.mo.lToW = transform.localToWorldMatrix;
 #endif
+
+            float timeNow = Time.timeSinceLevelLoad;
+            removeTimer += Mathf.Min(timeNow - timeAtLastCompute, minComputeTime * 1.2f);//Prevents removing all if got huge spike
+            timeAtLastCompute = timeNow;
+            float interval = voxRemoveInterval / Mathf.Max(1.0f, lastToRemoveCount * perVoxIntervalFactor);
+            int remCount = Mathf.FloorToInt(removeTimer / interval);
+            removeTimer -= interval * remCount;
+            cm_job.mo.mayRemoveCount = remCount;
 
             cm_job.chunksOnly = chunksOnly;
             cm_handle = bc_isActive == true ? cm_job.Schedule(bc_handle) : cm_job.Schedule();
@@ -355,7 +387,7 @@ namespace zombGen
                         {
                             if (voxI < 0)
                             {//Remove colliders instantly
-                                int vI = Mathf.Abs(voxI);
+                                int vI = math.abs(voxI);
                                 voxsToUpdate.Remove(vI);//If added and deleted before processed
                                 if (voxIToCol.Remove(vI, out SphereCollider col) == false) continue;
                                 col.gameObject.SetActive(false);
@@ -367,14 +399,37 @@ namespace zombGen
                         }
                     }
 
-                    UpdateRigidbody();
+                    if (Application.isPlaying == true)
+                    {
+                        ////Thanks to the way stuff is added to list, middle index is usually the rough center of all voxels that broke
+                        //int centerVI = _mo.addedRemovedVoxsI[(_mo.addedRemovedVoxsI.Length - 1) / 2];
+                        //if (centerVI >= 0) centerVI = _mo.addedRemovedVoxsI[^1];
+                        //if (centerVI < 0)
+                        //{
+                        //    breakAudioProps.pos = transform.TransformPoint(_mo.VoxIndexToPosL(-centerVI));
+                        //    breakAudio.Play(breakAudioProps);
+                        //}
+
+                        UpdateRigidbody();
+                        //if (voxJobInitlized == true)
+                        //    _voxsToSet_write.AddRange(_mo.addedRemovedVoxsI.AsArray());
+                    }
+
                     _mo.addedRemovedVoxsI.Clear();
                 }
             }
             else cm_job.mda.Dispose();
-            
-            if (_mo.voxsToCheck.Length > 0)
+
+            if (_mo.voxsToCheck.Count > 0)
                 chunksNeedsComputing = true;
+
+            int remCount = _mo.voxsToRemove.Length;
+            if (remCount > 0)
+            {
+                lastToRemoveCount = Mathf.Max(lastToRemoveCount, remCount);
+                meshNeedsComputing = true;
+            }
+            else lastToRemoveCount = 0;
 
             MarchingObject.Unmanaged mo = _mo.newMO.Value;
             TryCreateChunkFrom(ref mo);
@@ -420,9 +475,10 @@ namespace zombGen
             public Matrix4x4 wToL;
             public NativeReference<Result> result;
             public NativeArray<Action>.ReadOnly actions;
+
             public bool chunksOnly;
             public bool smoothNormals;
-            public bool canBreak;
+            public BreakMode breakMode;
 
             public void Execute()
             {
@@ -430,15 +486,16 @@ namespace zombGen
                 {
                     foreach (Action a in actions)
                     {
-                        int voxI = mo.PosLToVoxIndex(wToL.MultiplyPoint3x4(a.posW));
-                        mo.SetVoxelsAround(voxI, a.radiusW, a.type == Action.Type.remove ? -1 : 1);
+                        int voxI = mo.PosLToVoxIndex(wToL.MultiplyPoint3x4(a.posW + (0.5f * MeshGenGlobals.voxelSizeWorld * Vector3.one)));
+                        Debug.DrawLine(a.posW, a.posW + Vector3.up, Color.red, 2.0f, false);
+                        mo.SetVoxelsAround(voxI, a.radiusW, a.type == Action.Type.remove ? -1 : 1, a.radiusW < 2.01f);
                     }
 
                     mo.Meshify(mda[0], smoothNormals, out Bounds bl);
                     result.Value = new(bl);
                 }
 
-                if (canBreak == false)
+                if (breakMode == BreakMode.none)
                 {
                     mo.voxsToCheck.Clear();
                     return;
@@ -525,6 +582,9 @@ namespace zombGen
         {
             if (voxsToUpdate.Count == 0) return;
             int loopCount = -1;
+            int vCountYZ = _mo.data.vCountYZ;
+            int vCountZ = _mo.data.vCountZ;
+            float3 voxSize = _mo.data.voxSize;
 
             foreach (int voxI in voxsToUpdate)
             {
@@ -572,8 +632,8 @@ namespace zombGen
                 {
                     int vI = voxI;
                     byte vState = _mo.voxsState[voxI];//Can read while burst is writing, potential race, who cares
-                    if ((vState & (1 << 1)) != 0) vI += _mo.vCountYZ;
-                    if ((vState & (1 << 2)) != 0) vI += _mo.vCountZ;
+                    if ((vState & (1 << 1)) != 0) vI += vCountYZ;
+                    if ((vState & (1 << 2)) != 0) vI += vCountZ;
                     if ((vState & (1 << 3)) != 0) vI += 1;
 
                     col.transform.localPosition = _mo.VoxIndexToPosL(vI);
@@ -581,7 +641,7 @@ namespace zombGen
                 }
 
                 col.transform.localPosition = _mo.VoxIndexToPosL(voxI)
-                    + (_mo.voxSize * 0.5f);
+                    + (voxSize * 0.5f);
             }
 
             if (loopCount >= maxPrimUpdatesPerFrame)
@@ -638,12 +698,17 @@ namespace zombGen
             Rigidbody newRb = newO.GetComponent<Rigidbody>();
             newRb.interpolation = interpolation;
             newRb.constraints = RigidbodyConstraints.FreezeAll;
-            if (this.rb != null)
-            {
-                newRb.velocity = this.rb.velocity;
-                newRb.angularVelocity = this.rb.angularVelocity;
-                newRb.useGravity = this.rb.useGravity;
-            }
+            //newRb.MoveRotation(rot);
+            newRb.rotation = rot;//Setting both transform and rb seems to be the only reliable way to make sure it applies, wtf?
+            //newRb.MovePosition(pos);
+            newRb.position = pos;
+
+            //if (this.rb != null)
+            //{
+            //    newRb.velocity = this.rb.velocity;
+            //    newRb.angularVelocity = this.rb.angularVelocity;
+            //    newRb.useGravity = this.rb.useGravity;
+            //}
 
             MeshGenObject mgo = newO.GetComponent<MeshGenObject>();
             mgo.SetMO(new(mo));
@@ -669,6 +734,111 @@ namespace zombGen
         }
 
         #endregion Chunks
+
+        //#region Voxels
+        //
+        //private bool voxJobInitlized = false;
+        //private ComputeVoxels cv_job;
+        //private JobHandle cv_handle;
+        //private bool voxsFlipped = false;
+        //private NativeList<int> voxsToSetA;
+        //private NativeList<int> voxsToSetB;
+        //private NativeList<int> _voxsToSet_write => voxsFlipped == true ? voxsToSetB : voxsToSetA;
+        //private NativeArray<int>.ReadOnly _voxsToSet_read => voxsFlipped == true
+        //    ? voxsToSetA.AsReadOnly() : voxsToSetB.AsReadOnly();
+        //
+        //private void InitVoxels()
+        //{
+        //    if (voxJobInitlized == true) return;
+        //    if (usePrimitiveColliders == true || Application.isPlaying == false) return;
+        //    voxJobInitlized = true;
+        //
+        //    voxsToSetA = new(64, Allocator.Persistent);
+        //    voxsToSetB = new(64, Allocator.Persistent);
+        //    VoxGlobalHandler.OnScheduleWriteOperations += OnScheduleWriteOperations;
+        //    VoxGlobalHandler.OnSetupVoxelSystem += OnSetupVoxelSystem;
+        //    if (VoxGlobalHandler._hasBeenSetup == true) OnSetupVoxelSystem();
+        //}
+        //
+        //private void DisposeVoxels()
+        //{
+        //    if (voxJobInitlized == false) return;
+        //    voxJobInitlized = false;
+        //
+        //    VoxGlobalHandler.OnScheduleWriteOperations -= OnScheduleWriteOperations;
+        //    VoxGlobalHandler.OnSetupVoxelSystem -= OnSetupVoxelSystem;
+        //    cv_handle.Complete();
+        //    voxsToSetA.Dispose();
+        //    voxsToSetB.Dispose();
+        //}
+        //
+        //private unsafe void OnSetupVoxelSystem()
+        //{
+        //    cv_job = new()
+        //    {
+        //        mod = _mo.data,
+        //        lToW = transform.localToWorldMatrix,
+        //        vWorld = VoxGlobalHandler._voxWorldNative_readonly,
+        //        voxsCount = VoxGlobalHandler._voxGridCount_readWrite,
+        //        voxsType = VoxGlobalHandler._voxGrid_readWrite,
+        //        voxsTypeOld = VoxGlobalHandler._voxGridOld_readWrite,
+        //    };
+        //}
+        //
+        //private JobHandle OnScheduleWriteOperations(JobHandle dependOn)
+        //{
+        //    voxsFlipped = !voxsFlipped;
+        //    cv_job.voxsToSet_read = _voxsToSet_read;
+        //    _voxsToSet_write.Clear();
+        //    cv_handle = cv_job.Schedule(dependOn);
+        //    return cv_handle;
+        //}
+        //
+        //[BurstCompile]
+        //private unsafe struct ComputeVoxels : IJob
+        //{
+        //    public NativeArray<int>.ReadOnly voxsToSet_read;
+        //    [NativeDisableUnsafePtrRestriction] public MarchingObject.Data mod;
+        //    public Matrix4x4 lToW;
+        //    public NativeReference<VoxWorld>.ReadOnly vWorld;
+        //    [NativeDisableUnsafePtrRestriction] public byte* voxsCount;
+        //    [NativeDisableUnsafePtrRestriction] public byte* voxsType;
+        //    [NativeDisableUnsafePtrRestriction] public byte* voxsTypeOld;
+        //
+        //    public void Execute()
+        //    {
+        //        VoxWorld vWorld = this.vWorld.Value;
+        //        int vwCountZ = vWorld.vCountZ;
+        //        int vwCountZY = vWorld.vCountYZ;
+        //        float worldMaxX = vWorld.vCountX * VoxGlobalSettings.voxelSizeWorld;
+        //        float worldMaxY = vWorld.vCountY * VoxGlobalSettings.voxelSizeWorld;
+        //        float worldMaxZ = vWorld.vCountZ * VoxGlobalSettings.voxelSizeWorld;
+        //
+        //        foreach (int mo_voxI in voxsToSet_read)
+        //        {
+        //            Vector3 voxPos = lToW.MultiplyPoint3x4(mod.VoxIndexToPosL(math.abs(mo_voxI)));
+        //            if (voxPos.x < 0 || voxPos.y < 0 || voxPos.z < 0//Prevent out of bounds (Accurate, no warping)
+        //                || voxPos.x > worldMaxX || voxPos.y > worldMaxY || voxPos.z > worldMaxZ) continue;
+        //
+        //            int wvIndex = (int)(voxPos.z * VoxGlobalSettings.voxelSizeWorldInv)
+        //                + ((int)(voxPos.y * VoxGlobalSettings.voxelSizeWorldInv) * vwCountZ)
+        //                + ((int)(voxPos.x * VoxGlobalSettings.voxelSizeWorldInv) * vwCountZY);
+        //
+        //            if (mo_voxI > 0)
+        //            {
+        //                VoxHelpBurst.AddVoxAtPos(wvIndex, VoxGlobalSettings.defualtType, voxsCount,
+        //                    voxsType, voxsTypeOld, vwCountZ, vwCountZY);
+        //            }
+        //            else if (mo_voxI != 0)
+        //            {
+        //                VoxHelpBurst.RemoveVoxAtPos(wvIndex, VoxGlobalSettings.defualtType, voxsCount,
+        //                    voxsType, voxsTypeOld, vwCountZ, vwCountZY);
+        //            }
+        //        }
+        //    }
+        //}
+        //
+        //#endregion Voxels
     }
 }
 

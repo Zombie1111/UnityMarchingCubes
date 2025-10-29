@@ -20,7 +20,7 @@ Burst and job compatible implementation of Marching Cubes
 <ul>
 <li>Unity 2023.2.20f1 (Built-in)</li>
 <li>Burst 1.8.13</li>
-<li>Collections 1.4.0</li>
+<li>Collections 2.1.4</li>
 <li>Mathematics 1.2.6</li>
 </ul>
 
