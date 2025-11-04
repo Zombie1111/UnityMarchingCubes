@@ -138,6 +138,7 @@ namespace zombGen
             newMO.Dispose();
             voxsToCheck.Dispose();
             solidVoxCount.Dispose();
+            voxsToRemove.Dispose();
         }
 
         /// <summary>
